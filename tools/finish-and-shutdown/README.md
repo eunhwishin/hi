@@ -15,6 +15,34 @@
 - 찌꺼기가 기록·커밋되지 않도록 정리를 가장 먼저 합니다.
 - `.git`, `node_modules`, `.venv` 폴더는 건드리지 않습니다. `*.bak` 은 기본으로 지우지 않습니다 (FixHYFont 백업 보호).
 
+## ★ Claude Code 작업이 끝나면 자동으로 저장 후 종료하기
+
+Claude Code 의 **Stop 훅**(Claude 가 응답을 끝낼 때 실행되는 명령)에 연결합니다.
+평소에는 아무 일도 하지 않고, **종료 예약을 켠 경우에만 한 번** 실행됩니다.
+
+1. **훅 등록 (처음 한 번)**: `install_hook.bat` 더블클릭
+   - `%USERPROFILE%\.claude\settings.json` 에 Stop 훅이 추가됩니다 (기존 설정은 `.bak_날짜` 로 백업).
+   - 이미 실행 중인 Claude Code 에서는 `/hooks` 를 한 번 열어 확인하거나 Claude Code 를 다시 시작해야 적용될 수 있습니다.
+2. **종료 예약**: 자리를 비우기 전에 `arm_shutdown.bat` 더블클릭
+   - Claude 가 작업을 끝내는 순간 → 새 창에서 정리·기록·커밋 → 120초 카운트다운 → 컴퓨터 종료
+   - 작업 폴더는 Claude Code 가 작업 중인 폴더가 자동으로 쓰입니다.
+3. **예약 취소**: `disarm_shutdown.bat` 더블클릭
+
+명령줄로 하려면:
+```bat
+python finish_and_shutdown.py --install-hook
+python finish_and_shutdown.py --arm --delay 120 --backup D:\backup
+python finish_and_shutdown.py --status
+python finish_and_shutdown.py --disarm
+python finish_and_shutdown.py --uninstall-hook
+```
+
+> ⚠ Stop 훅은 Claude 가 **질문하려고 멈출 때도** 실행됩니다. 예약을 켜 두었다면 Claude 에게
+> "질문하지 말고 끝까지 진행해" 라고 미리 말해 두세요. 실수로 꺼질 것 같으면 카운트다운 창에서 **Ctrl+C**.
+>
+> 이 방식은 **내 컴퓨터에서 실행 중인 Claude Code**(터미널 `claude` 또는 데스크톱 앱의 로컬 세션)에서만 동작합니다.
+> 웹(claude.ai/code)의 클라우드 세션은 내 컴퓨터를 끌 수 없습니다.
+
 ## 준비
 Python 3.8 이상 (Windows: <https://www.python.org> 또는 `winget install Python.Python.3.12`). 추가 설치 패키지 없음.
 

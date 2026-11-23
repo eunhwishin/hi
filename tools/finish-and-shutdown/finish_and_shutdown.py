@@ -17,6 +17,7 @@ finish_and_shutdown.py - 코딩이 끝나면 기록 → 정리 → 저장 → �
 import argparse
 import datetime as dt
 import fnmatch
+import json
 import os
 import platform
 import shutil
@@ -41,6 +42,10 @@ JUNK_DIRS = ["__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv"}
 
 LOG_NAME = "WORKLOG.md"
+CLAUDE_DIR = Path.home() / ".claude"
+ARM_FILE = CLAUDE_DIR / "finish_and_shutdown.armed.json"   # 종료 예약 표시 파일
+HOOK_LOG = CLAUDE_DIR / "finish_and_shutdown.log"
+HOOK_MARK = "finish_and_shutdown.py"
 
 
 class StepError(Exception):
@@ -343,7 +348,7 @@ def parse_args(argv=None):
                "  python finish_and_shutdown.py D:\\work\\myproj --dry-run\n"
                "  python finish_and_shutdown.py D:\\work\\myproj --idle 10 --backup D:\\backup\n"
                "  python finish_and_shutdown.py . --wait-process Code.exe --push -m \"로그인 기능 완료\"\n")
-    p.add_argument("folder", nargs="?", default=".", help="작업 폴더 (기본: 현재 폴더)")
+    p.add_argument("folder", nargs="?", default=None, help="작업 폴더 (기본: 현재 폴더 / 훅에서는 Claude Code 작업 폴더)")
     p.add_argument("-m", "--message", help="기록/커밋에 남길 메모")
     g = p.add_argument_group("대기 (둘 다 없으면 바로 실행)")
     g.add_argument("--idle", type=float, metavar="분", help="폴더에 이 시간(분) 동안 변경이 없으면 완료로 판단")
@@ -362,12 +367,175 @@ def parse_args(argv=None):
     g.add_argument("--no-shutdown", action="store_true", help="모든 작업 후 컴퓨터는 끄지 않음")
     g.add_argument("--force", action="store_true", help="중간 단계가 실패해도 컴퓨터 종료")
     g.add_argument("--dry-run", action="store_true", help="실제로 바꾸지 않고 무엇을 할지만 보여줌")
+    g = p.add_argument_group("Claude Code 연동 (작업이 끝나면 자동 실행)")
+    g.add_argument("--install-hook", action="store_true", help="Claude Code 설정에 Stop 훅 등록 (처음 한 번)")
+    g.add_argument("--uninstall-hook", action="store_true", help="등록한 Stop 훅 제거")
+    g.add_argument("--arm", action="store_true", help="종료 예약: Claude 가 다음에 작업을 끝내면 실행 (함께 준 옵션 사용)")
+    g.add_argument("--disarm", action="store_true", help="종료 예약 취소")
+    g.add_argument("--status", action="store_true", help="훅 등록/예약 상태 보기")
+    g.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)   # Claude Code 가 호출
+    g.add_argument("--hold", action="store_true", help=argparse.SUPPRESS)   # 끝난 뒤 창 유지
     return p.parse_args(argv)
 
 
+# ----------------------------------------------------------------- Claude Code 연동
+def settings_path() -> Path:
+    return CLAUDE_DIR / "settings.json"
+
+
+def load_settings():
+    sp = settings_path()
+    if not sp.exists():
+        return {}
+    try:
+        return json.loads(sp.read_text(encoding="utf-8") or "{}")
+    except json.JSONDecodeError as e:
+        raise StepError(f"{sp} 이 올바른 JSON 이 아닙니다: {e}")
+
+
+def save_settings(data):
+    sp = settings_path()
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    if sp.exists():
+        shutil.copy2(sp, sp.with_name(f"settings.json.bak_{now():%Y%m%d_%H%M%S}"))
+    sp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def hook_entries(data):
+    return data.setdefault("hooks", {}).setdefault("Stop", [])
+
+
+def has_our_hook(group):
+    return any(HOOK_MARK in h.get("command", "") for h in group.get("hooks", []))
+
+
+def install_hook():
+    data = load_settings()
+    stop = hook_entries(data)
+    stop[:] = [g for g in stop if not has_our_hook(g)]
+    cmd = f'"{sys.executable}" "{Path(__file__).resolve()}" --hook'
+    stop.append({"hooks": [{"type": "command", "command": cmd, "timeout": 30}]})
+    save_settings(data)
+    say(f"Stop 훅을 등록했습니다: {settings_path()}")
+    say(f"  명령: {cmd}")
+    say("  ※ 이미 실행 중인 Claude Code 에는 바로 적용되지 않을 수 있습니다.")
+    say("    Claude Code 에서 /hooks 를 한 번 열어 확인하거나, Claude Code 를 다시 시작하세요.")
+    say("  ※ 훅만 등록하면 아무 일도 일어나지 않습니다. 끄고 싶은 날 --arm 으로 예약하세요.")
+
+
+def uninstall_hook():
+    data = load_settings()
+    stop = hook_entries(data)
+    before = len(stop)
+    stop[:] = [g for g in stop if not has_our_hook(g)]
+    if not stop:
+        data["hooks"].pop("Stop")
+        if not data["hooks"]:
+            data.pop("hooks")
+    save_settings(data)
+    say(f"Stop 훅 {before - len(stop)}개를 제거했습니다.")
+
+
+def strip_args(argv, folder):
+    out, removed = [], False
+    for a in argv:
+        if a == "--arm":
+            continue
+        if folder is not None and not removed and a == folder:
+            removed = True
+            continue
+        out.append(a)
+    return out
+
+
+def arm(args, argv):
+    folder = str(Path(args.folder).expanduser().resolve()) if args.folder else None
+    if folder and not Path(folder).is_dir():
+        raise StepError(f"폴더가 없습니다: {folder}")
+    info = {"folder": folder, "argv": strip_args(argv, args.folder), "armed_at": f"{now():%Y-%m-%d %H:%M}"}
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    ARM_FILE.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    hooked = any(has_our_hook(g) for g in load_settings().get("hooks", {}).get("Stop", []))
+    say("종료 예약 완료: Claude Code 가 다음에 작업을 끝내면 마무리 후 컴퓨터를 끕니다.")
+    say(f"  폴더: {folder or '(Claude Code 작업 폴더)'}")
+    say(f"  옵션: {' '.join(info['argv']) or '(기본)'}")
+    say("  취소: --disarm")
+    if not hooked:
+        say("  ! 아직 Stop 훅이 등록되지 않았습니다. 먼저 --install-hook 을 실행하세요.")
+
+
+def disarm():
+    if ARM_FILE.exists():
+        ARM_FILE.unlink()
+        say("종료 예약을 취소했습니다.")
+    else:
+        say("예약된 종료가 없습니다.")
+
+
+def status():
+    hooked = any(has_our_hook(g) for g in load_settings().get("hooks", {}).get("Stop", []))
+    say(f"Stop 훅 등록: {'예' if hooked else '아니오'} ({settings_path()})")
+    if ARM_FILE.exists():
+        info = json.loads(ARM_FILE.read_text(encoding="utf-8"))
+        say(f"종료 예약: 켜짐 ({info.get('armed_at')}) 폴더={info.get('folder') or '(Claude Code 작업 폴더)'} "
+            f"옵션={' '.join(info.get('argv', [])) or '(기본)'}")
+    else:
+        say("종료 예약: 꺼짐")
+
+
+def run_hook():
+    """Claude Code 의 Stop 훅에서 호출. 예약이 있을 때만 새 창에서 마무리 루틴을 띄우고 바로 끝난다."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        payload = {}
+    if payload.get("stop_hook_active") or not ARM_FILE.exists():
+        return 0
+    try:
+        info = json.loads(ARM_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        info = {}
+    ARM_FILE.unlink(missing_ok=True)          # 한 번만 실행 (연달아 꺼지는 것 방지)
+    folder = info.get("folder") or payload.get("cwd") or os.getcwd()
+    cmd = [sys.executable, str(Path(__file__).resolve()), folder, *info.get("argv", []), "--hold"]
+    with open(HOOK_LOG, "a", encoding="utf-8") as fh:
+        fh.write(f"{now():%Y-%m-%d %H:%M:%S} 실행: {cmd}\n")
+    if os.name == "nt":
+        subprocess.Popen(cmd, cwd=folder, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        out = open(HOOK_LOG, "a", encoding="utf-8")
+        subprocess.Popen(cmd, cwd=folder, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
+                         start_new_session=True)
+    return 0
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
-    root = Path(args.folder).expanduser().resolve()
+    try:
+        if args.hook:
+            return run_hook()
+        if args.install_hook:
+            return install_hook() or 0
+        if args.uninstall_hook:
+            return uninstall_hook() or 0
+        if args.arm:
+            return arm(args, argv) or 0
+        if args.disarm:
+            return disarm() or 0
+        if args.status:
+            return status() or 0
+    except StepError as e:
+        say(f"! {e}")
+        return 1
+    rc = finish(args)
+    if args.hold and rc != 0 and sys.stdin and sys.stdin.isatty():
+        input("\nEnter 를 누르면 창을 닫습니다...")
+    return rc
+
+
+def finish(args):
+    root = Path(args.folder or ".").expanduser().resolve()
     if not root.is_dir():
         say(f"폴더가 없습니다: {root}")
         return 2
