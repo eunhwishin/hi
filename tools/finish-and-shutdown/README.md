@@ -24,9 +24,14 @@ Claude Code 의 **Stop 훅**(Claude 가 응답을 끝낼 때 실행되는 명령
    - `%USERPROFILE%\.claude\settings.json` 에 Stop 훅이 추가됩니다 (기존 설정은 `.bak_날짜` 로 백업).
    - 이미 실행 중인 Claude Code 에서는 `/hooks` 를 한 번 열어 확인하거나 Claude Code 를 다시 시작해야 적용될 수 있습니다.
 2. **종료 예약**: 자리를 비우기 전에 `arm_shutdown.bat` 더블클릭
-   - Claude 가 작업을 끝내는 순간 → 새 창에서 정리·기록·커밋 → 120초 카운트다운 → 컴퓨터 종료
+   - Claude 가 작업을 끝내는 순간 → 정리·기록·커밋 → 120초 후 컴퓨터 종료
    - 작업 폴더는 Claude Code 가 작업 중인 폴더가 자동으로 쓰입니다.
-3. **예약 취소**: `disarm_shutdown.bat` 더블클릭
+3. **예약 취소**: `disarm_shutdown.bat` 더블클릭 (이미 시작된 Windows 종료 카운트다운도 취소)
+4. **상태/로그 확인**: `status.bat` 더블클릭 – 훅이 호출됐는지, 어디서 멈췄는지 로그로 보여줍니다.
+5. **시험해 보기**: `arm_test.bat` – 컴퓨터는 끄지 않고 정리·기록·저장만 실행. Claude 에게 아무 말이나 보내 응답이 끝나면 `status.bat` 으로 확인.
+
+훅이 실행되면 그 자리에서 정리·기록·커밋을 마친 뒤 Windows 의 `shutdown /s /t 120` 으로 종료를 예약합니다
+(화면에 "곧 종료됩니다" 알림이 뜸). 실행 기록은 `%USERPROFILE%\.claude\finish_and_shutdown.log` 에 남습니다.
 
 명령줄로 하려면:
 ```bat
@@ -38,7 +43,7 @@ python finish_and_shutdown.py --uninstall-hook
 ```
 
 > ⚠ Stop 훅은 Claude 가 **질문하려고 멈출 때도** 실행됩니다. 예약을 켜 두었다면 Claude 에게
-> "질문하지 말고 끝까지 진행해" 라고 미리 말해 두세요. 실수로 꺼질 것 같으면 카운트다운 창에서 **Ctrl+C**.
+> "질문하지 말고 끝까지 진행해" 라고 미리 말해 두세요. 실수로 꺼질 것 같으면 `disarm_shutdown.bat` (또는 명령 `shutdown /a`).
 >
 > 이 방식은 **내 컴퓨터에서 실행 중인 Claude Code**(터미널 `claude` 또는 데스크톱 앱의 로컬 세션)에서만 동작합니다.
 > 웹(claude.ai/code)의 클라우드 세션은 내 컴퓨터를 끌 수 없습니다.

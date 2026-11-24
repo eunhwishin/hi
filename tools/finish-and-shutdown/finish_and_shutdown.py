@@ -324,6 +324,20 @@ def step_shutdown(args):
     if args.dry_run:
         say(f"[5/5 종료] (dry-run) {args.delay}초 후 실행할 명령: {' '.join(cmd)}")
         return
+    if args.scheduled:
+        # 훅에서 실행될 때: 이 프로그램이 끝난 뒤에도 OS 가 알아서 끄도록 예약만 걸고 바로 끝낸다
+        if platform.system() == "Windows":
+            sched = ["shutdown", "/s", "/t", str(args.delay), "/c",
+                     f"Claude Code 작업 완료 - {args.delay}초 후 종료합니다. 취소: disarm_shutdown.bat 또는 shutdown /a"]
+            r = subprocess.run(sched, capture_output=True, text=True, errors="replace")
+            if r.returncode != 0:
+                raise StepError(f"종료 예약 실패: {' '.join(sched)}\n{r.stdout}{r.stderr}")
+        else:
+            subprocess.Popen(["sh", "-c", f"sleep {int(args.delay)}; " + " ".join(f"'{c}'" for c in cmd)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        say(f"[5/5 종료] {args.delay}초 후 컴퓨터 종료를 예약했습니다.")
+        return
     say(f"[5/5 종료] {args.delay}초 후 컴퓨터를 종료합니다. 취소하려면 Ctrl+C 를 누르세요.")
     try:
         for left in range(args.delay, 0, -1):
@@ -375,6 +389,7 @@ def parse_args(argv=None):
     g.add_argument("--status", action="store_true", help="훅 등록/예약 상태 보기")
     g.add_argument("--hook", action="store_true", help=argparse.SUPPRESS)   # Claude Code 가 호출
     g.add_argument("--hold", action="store_true", help=argparse.SUPPRESS)   # 끝난 뒤 창 유지
+    g.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)  # OS 예약 종료 사용
     return p.parse_args(argv)
 
 
@@ -414,7 +429,7 @@ def install_hook():
     stop = hook_entries(data)
     stop[:] = [g for g in stop if not has_our_hook(g)]
     cmd = f'"{sys.executable}" "{Path(__file__).resolve()}" --hook'
-    stop.append({"hooks": [{"type": "command", "command": cmd, "timeout": 30}]})
+    stop.append({"hooks": [{"type": "command", "command": cmd, "timeout": 600}]})
     save_settings(data)
     say(f"Stop 훅을 등록했습니다: {settings_path()}")
     say(f"  명령: {cmd}")
@@ -465,6 +480,10 @@ def arm(args, argv):
 
 
 def disarm():
+    if platform.system() == "Windows":        # 이미 걸린 Windows 종료 예약도 취소
+        r = subprocess.run(["shutdown", "/a"], capture_output=True)
+        if r.returncode == 0:
+            say("예약되어 있던 Windows 종료를 취소했습니다.")
     if ARM_FILE.exists():
         ARM_FILE.unlink()
         say("종료 예약을 취소했습니다.")
@@ -481,15 +500,31 @@ def status():
             f"옵션={' '.join(info.get('argv', [])) or '(기본)'}")
     else:
         say("종료 예약: 꺼짐")
+    if HOOK_LOG.exists():
+        lines = HOOK_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+        say(f"\n최근 로그 ({HOOK_LOG}):")
+        for line in lines[-15:]:
+            say("  " + line)
+    else:
+        say("\n로그 없음: 훅이 한 번도 호출되지 않았습니다 (Claude Code 가 훅을 불러오지 않음).")
+
+
+def hook_log(msg):
+    CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(HOOK_LOG, "a", encoding="utf-8") as fh:
+        fh.write(f"{now():%Y-%m-%d %H:%M:%S} {msg}\n")
 
 
 def run_hook():
-    """Claude Code 의 Stop 훅에서 호출. 예약이 있을 때만 새 창에서 마무리 루틴을 띄우고 바로 끝난다."""
+    """Claude Code 의 Stop 훅에서 호출. 예약이 있을 때만 이 자리에서 마무리하고 OS 종료를 예약한다."""
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
         payload = {}
-    if payload.get("stop_hook_active") or not ARM_FILE.exists():
+    if payload.get("stop_hook_active"):
+        return 0
+    if not ARM_FILE.exists():
+        hook_log(f"훅 호출됨 - 예약 없음 (폴더: {payload.get('cwd')})")
         return 0
     try:
         info = json.loads(ARM_FILE.read_text(encoding="utf-8"))
@@ -497,15 +532,20 @@ def run_hook():
         info = {}
     ARM_FILE.unlink(missing_ok=True)          # 한 번만 실행 (연달아 꺼지는 것 방지)
     folder = info.get("folder") or payload.get("cwd") or os.getcwd()
-    cmd = [sys.executable, str(Path(__file__).resolve()), folder, *info.get("argv", []), "--hold"]
-    with open(HOOK_LOG, "a", encoding="utf-8") as fh:
-        fh.write(f"{now():%Y-%m-%d %H:%M:%S} 실행: {cmd}\n")
-    if os.name == "nt":
-        subprocess.Popen(cmd, cwd=folder, creationflags=subprocess.CREATE_NEW_CONSOLE)
-    else:
-        out = open(HOOK_LOG, "a", encoding="utf-8")
-        subprocess.Popen(cmd, cwd=folder, stdin=subprocess.DEVNULL, stdout=out, stderr=out,
-                         start_new_session=True)
+    argv = [folder, *info.get("argv", []), "--scheduled"]
+    hook_log(f"훅 호출됨 - 예약 실행: {argv}")
+    old = sys.stdout, sys.stderr
+    try:
+        with open(HOOK_LOG, "a", encoding="utf-8") as fh:
+            sys.stdout = sys.stderr = fh
+            rc = finish(parse_args(argv))
+    except BaseException as e:               # 어떤 오류든 로그에 남긴다
+        import traceback
+        hook_log("오류: " + traceback.format_exc())
+        rc = 1
+    finally:
+        sys.stdout, sys.stderr = old
+    hook_log(f"마무리 끝 (결과 코드 {rc}{'' if rc == 0 else ', 실패하여 종료하지 않음'})")
     return 0
 
 
